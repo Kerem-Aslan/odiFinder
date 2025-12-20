@@ -53,7 +53,7 @@ def resource_path(relative_path):
     return os.path.join(os.path.abspath("."), relative_path)
 
 class OdiFinderApp:
-    APP_VERSION = "1.4.3"
+    APP_VERSION = "1.4.4"
 
     def __init__(self):
         self.session: Optional[requests.Session] = None
@@ -74,12 +74,13 @@ class OdiFinderApp:
         self.settings_path = get_settings_path()
         self.plyer_notification_available = False
         self.plyer_notification = None
-        if platform.system() != "Windows":
-            try:
-                from plyer import notification as plyer_notify_module
-                self.plyer_notification = plyer_notify_module
-                self.plyer_notification_available = True
-            except ImportError:
+        # Try plyer for all platforms as fallback
+        try:
+            from plyer import notification as plyer_notify_module
+            self.plyer_notification = plyer_notify_module
+            self.plyer_notification_available = True
+        except ImportError:
+            if platform.system() != "Windows":
                 print("Plyer library not found for non-Windows. Notifications will be OS-dependent.")
         self._load_settings()
         self._load_city_names()
@@ -234,11 +235,18 @@ class OdiFinderApp:
             output_lines, current_meal_names_now = [], set()
             if current_meals:
                 for meal in current_meals:
-                    output_lines.extend([f"Restaurant: {meal['restaurant_name']}", f"Meal: {meal['meal_name']}", f"Location: {meal['location']}", f"{meal.get('available_count', 0)} meals available", "-" * 40])
+                    output_lines.extend([f"Restaurant: {meal['restaurant_name']}", f"Meal: {meal['meal_name']}", f"Location: {meal['location']}", "Meals available", "-" * 40])
                     current_meal_names_now.add(meal['restaurant_name'])
                 newly_found = current_meal_names_now - self.previously_found_meal_names
+                print(f"Debug: newly_found={newly_found}, notifications_enabled={self.notifications_enabled}, previously_found={self.previously_found_meal_names}, current={current_meal_names_now}")
                 if newly_found and self.notifications_enabled:
-                    self._send_notification(f"New: {', '.join(sorted(list(newly_found)))}"[:250])
+                    notification_msg = f"New: {', '.join(sorted(list(newly_found)))}"[:250]
+                    print(f"Debug: Sending notification: {notification_msg}")
+                    self._send_notification(notification_msg)
+                elif newly_found:
+                    print(f"Debug: New restaurants found but notifications are disabled")
+                elif not newly_found and current_meals:
+                    print(f"Debug: Restaurants found but no new ones (already seen before)")
             else:
                 output_lines.append(f"No meals found for specified restaurants in {self.city_names.get(self.current_city_id, f'city {self.current_city_id}')} at this time.")
             self.previously_found_meal_names = current_meal_names_now
@@ -275,9 +283,11 @@ class OdiFinderApp:
     def _send_notification(self, message_text: str):
         title = "odiFinder: New Restaurants!"
         icon_to_use = self.icon_path if self.icon_path and os.path.exists(self.icon_path) else None
+        print(f"Debug _send_notification: platform={platform.system()}, WINOTIFY_AVAILABLE={WINOTIFY_AVAILABLE}, plyer_available={self.plyer_notification_available}, icon_path={self.icon_path}, icon_exists={icon_to_use is not None}")
         try:
             if platform.system() == "Windows" and WINOTIFY_AVAILABLE:
-                Notification(app_id="odiFinder", title=title, msg=message_text, duration="long", icon=icon_to_use or "").show()
+                notification = Notification(app_id="odiFinder", title=title, msg=message_text, duration="long", icon=icon_to_use or "")
+                notification.show()
                 print(f"Sent Winotify notification: {message_text}")
             elif self.plyer_notification_available and self.plyer_notification is not None:
                 if callable(self.plyer_notification.notify):
@@ -287,11 +297,16 @@ class OdiFinderApp:
                     print("Plyer notification object exists but notify() is not callable")
             else:
                 print(f"Notification ready (but no backend): {title} - {message_text}")
+                print(f"Debug: Windows={platform.system() == 'Windows'}, WINOTIFY={WINOTIFY_AVAILABLE}, PLYER={self.plyer_notification_available}")
+                print("Please install winotify: pip install winotify")
         except Exception as e:
             print(f"Failed to send notification: {e}")
+            import traceback
+            traceback.print_exc()
 
     def handle_open_getodi(self):
-        webbrowser.open_new_tab("https://getodi.com")
+        city_url = f"https://getodi.com/student/?city={self.current_city_id}"
+        webbrowser.open_new_tab(city_url)
 
     def _schedule_next_refresh(self):
         self._cancel_periodic_refresh()

@@ -2,11 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.4] - 20 December 2025
+- Updated to work with the new website interface structure, so meal available count is gone :(
+- "getodi.com" button now redirects to the corresponding city page
+
 ## [1.4.3] - 10 August 2025
 
 ### Changed
 - Updated to work with the new website interface structure
-- Brought back the old display format (available meal count is back).
+- Brought back the old display format (available meal count is back)
 
 ## [1.4.2] - 18 June 2025
 
