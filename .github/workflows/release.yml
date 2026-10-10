@@ -1,0 +1,53 @@
+name: Build and release
+
+# Push a tag like v1.5.0 to build odiFinder.exe on Windows and publish it as a GitHub release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install pyinstaller requests beautifulsoup4 winotify pillow pystray
+
+      - name: Check that the tag matches APP_VERSION
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "APP_VERSION = \"$version\"" odiFinder.pyw; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match APP_VERSION in odiFinder.pyw"
+            exit 1
+          fi
+
+      - name: Build odiFinder.exe
+        run: pyinstaller --onefile --windowed --name odiFinder --icon odiFinderlogo.ico --add-data "odiFinderlogo.ico;." --hidden-import pystray._win32 odiFinder.pyw
+
+      - name: Write release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          {
+            echo "A Windows standalone \".exe\" release for $GITHUB_REF_NAME."
+            echo
+            awk -v header="## [$version]" 'index($0, header) == 1 { found = 1; next } /^## \[/ { found = 0 } found' CHANGELOG.md
+          } > release_notes.md
+          cat release_notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: odiFinder ${{ env.VERSION }}
+          body_path: release_notes.md
+          files: dist/odiFinder.exe
