@@ -2,11 +2,13 @@ import requests
 from datetime import datetime
 import json
 import os
-import locale
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Callable
 import platform
 import webbrowser
 import sys
+import threading
+import queue
+import traceback
 from ui import OdiFinderUI
 from network import login_to_odi, check_meals
 
@@ -25,8 +27,6 @@ except ImportError:
     PILLOW_AVAILABLE = False
     PYSTRAY_AVAILABLE = False
     print("Pillow or pystray library not found. System tray icon will be default.")
-
-locale.setlocale(locale.LC_ALL, 'tr_TR.UTF-8')
 
 def get_settings_path():
     if getattr(sys, 'frozen', False):  # Eğer exe'den çalışıyorsa
@@ -50,22 +50,32 @@ def resource_path(relative_path):
     base_path = getattr(sys, '_MEIPASS', None)
     if base_path:
         return os.path.join(base_path, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+DEFAULT_CITY_ID = "35"
+DEFAULT_REFRESH_INTERVAL_MIN = 3
+
+class RefreshError(Exception):
+    """A refresh failed in a way that should be shown to the user."""
 
 class OdiFinderApp:
-    APP_VERSION = "1.4.4"
+    APP_VERSION = "1.5.0"
 
     def __init__(self):
         self.session: Optional[requests.Session] = None
         self.username: str = ''
         self.password: str = ''
-        self.target_texts: List[str] = [""]
+        self.target_texts: List[str] = []
         self.notifications_enabled: bool = True
-        self.current_city_id: str = "35"
-        self.city_names: Dict[str, str] = {}
+        self.current_city_id: str = DEFAULT_CITY_ID
+        self.city_names: Dict[str, str] = {DEFAULT_CITY_ID: "İzmir"}
         self.previously_found_meal_names: Set[str] = set()
         self.periodic_refresh_id: Optional[str] = None
-        self.REFRESH_INTERVAL_MS: int = 3 * 60 * 1000
+        self.REFRESH_INTERVAL_MS: int = DEFAULT_REFRESH_INTERVAL_MIN * 60 * 1000
+        # Work from background threads (refresh worker, tray icon) is handed to the Tk thread through this queue
+        self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        self._refresh_in_progress = False
+        self._refresh_pending = False
         self.system_tray_icon: Optional[pystray.Icon] = None
         self.settings: Dict[str, Any] = {}
         self._cleanup_called_flag = False
@@ -83,7 +93,7 @@ class OdiFinderApp:
             if platform.system() != "Windows":
                 print("Plyer library not found for non-Windows. Notifications will be OS-dependent.")
         self._load_settings()
-        self._load_city_names()
+        threading.Thread(target=self._load_city_names, daemon=True).start()
         callbacks = {
             'on_login_attempt': self.handle_login_attempt,
             'open_debug_console': self.handle_open_debug_console,
@@ -96,9 +106,12 @@ class OdiFinderApp:
             'on_refresh_now': self.handle_meal_refresh,
             'on_open_getodi': self.handle_open_getodi,
             'on_quit_application': self.handle_quit_application,
+            'on_reset_settings': self.handle_reset_settings,
             'on_debug_console_closed_message': lambda: print("Debug console closed (via app callback).")
         }
         self.ui = OdiFinderUI(callbacks, self.icon_path)
+        # Use the saved theme from the start, so saving settings before the main window exists doesn't overwrite it
+        self.ui.current_theme_name = self.settings.get('theme', 'dark')
 
     def _load_settings(self):
         try:
@@ -108,7 +121,7 @@ class OdiFinderApp:
             self.target_texts = self.settings.get('restaurants', self.target_texts)
             self.notifications_enabled = self.settings.get('notifications_enabled', self.notifications_enabled)
             self.current_city_id = self.settings.get('city_id', self.current_city_id)
-            self.REFRESH_INTERVAL_MS = self.settings.get('refresh_interval', 3) * 60 * 1000
+            self.REFRESH_INTERVAL_MS = self.settings.get('refresh_interval', DEFAULT_REFRESH_INTERVAL_MIN) * 60 * 1000
         except (FileNotFoundError, json.JSONDecodeError):
             print("Settings file not found or invalid. Using defaults.")
             self.settings = {}
@@ -131,17 +144,18 @@ class OdiFinderApp:
             import csv
             from io import StringIO
             city_csv_url = "https://gist.githubusercontent.com/mebaysan/7a4ba8531187fa8703ff1f22692d5fa6/raw/df4e85262ba2a4f6d6045f06f417b853fb67e78c/il.csv"
-            response = requests.get(city_csv_url)
+            response = requests.get(city_csv_url, timeout=10)
             if response.status_code == 200:
+                city_names = {}
                 csv_reader = csv.reader(StringIO(response.text))
                 next(csv_reader)
                 for row in csv_reader:
                     if len(row) >= 2:
-                        self.city_names[row[0].zfill(2)] = row[1]
+                        city_names[row[0].zfill(2)] = row[1]
+                if city_names:
+                    self.city_names = city_names
         except Exception as e:
             print(f"Error loading city names: {e}")
-        if not self.city_names:
-            self.city_names = {"35": "İzmir"}
 
     def run(self):
         self.ui.display_login_window(self.username)
@@ -171,9 +185,26 @@ class OdiFinderApp:
     def _initialize_main_app_components(self):
         initial_ui_settings = self._get_initial_ui_settings()
         self.ui.initialize_main_window(initial_ui_settings)
+        self._process_ui_queue()
         self.handle_meal_refresh()
         self._schedule_next_refresh()
         self.ui.run_ui()
+
+    def _run_on_ui_thread(self, func: Callable[[], None]):
+        self._ui_queue.put(func)
+
+    def _process_ui_queue(self):
+        while True:
+            try:
+                func = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func()
+            except Exception:
+                traceback.print_exc()
+        if self.ui.app_root and self.ui.app_root.winfo_exists():
+            self.ui.app_root.after(100, self._process_ui_queue)
 
     def handle_toggle_notifications(self):
         self.notifications_enabled = self.ui.get_notifications_enabled()
@@ -205,6 +236,20 @@ class OdiFinderApp:
         self._save_settings()
         print(f"Theme changed to {self.ui.current_theme_name}")
 
+    def handle_reset_settings(self):
+        if not self.ui.ask_yes_no("Reset Settings", "Reset all settings (restaurant list, city, theme, notifications, refresh interval) to default?"):
+            return
+        self.target_texts = []
+        self.notifications_enabled = True
+        self.current_city_id = DEFAULT_CITY_ID
+        self.REFRESH_INTERVAL_MS = DEFAULT_REFRESH_INTERVAL_MIN * 60 * 1000
+        self.ui.apply_theme('dark')
+        self._save_settings()
+        self.ui.update_settings_display(self.settings)
+        print("Settings reset to defaults.")
+        self._schedule_next_refresh()
+        self.handle_meal_refresh()
+
     def handle_save_interval(self):
         try:
             interval_str = self.ui.get_interval_entry()
@@ -224,61 +269,75 @@ class OdiFinderApp:
         if not self.ui.app_root or not self.ui.app_root.winfo_exists():
             print("Meal refresh called but UI not ready.")
             return
-        if self.session is None:
-            print("No active session. Attempting re-login for meal refresh.")
-            self.ui.update_meals_display("Connection error. No session. Attempting re-login...", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-            self._attempt_relogin_and_refresh()
+        if self._refresh_in_progress:
+            # Settings changed mid-refresh: run again once the current refresh finishes
+            self._refresh_pending = True
             return
-        try:
-            current_meals = check_meals(self.session, self.target_texts, self.current_city_id)
-            refresh_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            output_lines, current_meal_names_now = [], set()
-            if current_meals:
-                for meal in current_meals:
-                    output_lines.extend([f"Restaurant: {meal['restaurant_name']}", f"Meal: {meal['meal_name']}", f"Location: {meal['location']}", "Meals available", "-" * 40])
-                    current_meal_names_now.add(meal['restaurant_name'])
-                newly_found = current_meal_names_now - self.previously_found_meal_names
-                print(f"Debug: newly_found={newly_found}, notifications_enabled={self.notifications_enabled}, previously_found={self.previously_found_meal_names}, current={current_meal_names_now}")
-                if newly_found and self.notifications_enabled:
-                    notification_msg = f"New: {', '.join(sorted(list(newly_found)))}"[:250]
-                    print(f"Debug: Sending notification: {notification_msg}")
-                    self._send_notification(notification_msg)
-                elif newly_found:
-                    print(f"Debug: New restaurants found but notifications are disabled")
-                elif not newly_found and current_meals:
-                    print(f"Debug: Restaurants found but no new ones (already seen before)")
-            else:
-                output_lines.append(f"No meals found for specified restaurants in {self.city_names.get(self.current_city_id, f'city {self.current_city_id}')} at this time.")
-            self.previously_found_meal_names = current_meal_names_now
-            self.ui.update_meals_display("\n".join(output_lines), refresh_time_str)
-            print(f"GUI Refreshed: {refresh_time_str}. City: {self.current_city_id}. Found: {bool(current_meals)}")
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Connection error: {e}.\nAttempting re-login..."
-            print(error_msg)
-            self.ui.update_meals_display(error_msg, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-            self._attempt_relogin_and_refresh()
-        except Exception as e:
-            error_msg = f"Error updating meals: {e}"
-            print(error_msg)
-            import traceback
-            traceback.print_exc()
-            self.ui.update_meals_display(error_msg, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        self._refresh_in_progress = True
+        self.ui.set_refreshing(True)
+        threading.Thread(target=self._refresh_worker, args=(list(self.target_texts), self.current_city_id), daemon=True).start()
 
-    def _attempt_relogin_and_refresh(self):
+    def _refresh_worker(self, target_texts: List[str], city_id: str):
+        """Runs on a background thread so network calls don't freeze the window."""
+        meals: Optional[List[Dict[str, Any]]] = None
+        error_msg: Optional[str] = None
+        try:
+            if self.session is not None:
+                meals = check_meals(self.session, target_texts, city_id)
+            if meals is None:
+                print("No active session or session expired. Attempting re-login...")
+                meals = self._relogin_and_check_meals(target_texts, city_id)
+        except RefreshError as e:
+            error_msg = str(e)
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Connection error: {e}"
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = f"Error updating meals: {e}"
+        if error_msg:
+            print(error_msg)
+        self._run_on_ui_thread(lambda: self._apply_refresh_result(meals, error_msg, city_id))
+
+    def _relogin_and_check_meals(self, target_texts: List[str], city_id: str) -> List[Dict[str, Any]]:
         if not self.username or not self.password:
-            msg = "Cannot re-login: username or password not stored."
-            print(msg)
-            self.ui.update_meals_display(msg, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-            return
+            raise RefreshError("Cannot re-login: username or password not stored. Please restart the app.")
         new_session = login_to_odi(self.username, self.password)
-        if new_session:
-            self.session = new_session
-            self.ui.show_message(type="info", title="Re-login Successful", message="Successfully re-logged in. Meals will refresh shortly.")
-            if self.ui.app_root and self.ui.app_root.winfo_exists():
-                self.ui.app_root.after(200, self.handle_meal_refresh)
-        else:
-            relogin_fail_msg = "Failed to re-login. Check credentials/network. Manual refresh or restart may be needed."
-            self.ui.show_message(type="error", title="Re-login Failed", message=relogin_fail_msg)
+        if not new_session:
+            raise RefreshError("Session expired and re-login failed. Check your credentials/network.")
+        self.session = new_session
+        print("Re-login successful.")
+        meals = check_meals(new_session, target_texts, city_id)
+        if meals is None:
+            raise RefreshError("Re-logged in, but getodi.com still shows the login page.")
+        return meals
+
+    def _apply_refresh_result(self, meals: Optional[List[Dict[str, Any]]], error_msg: Optional[str], city_id: str):
+        self._refresh_in_progress = False
+        self.ui.set_refreshing(False)
+        refresh_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self.ui.app_root.after(0, self.handle_meal_refresh)
+        if error_msg or meals is None:
+            # Keep previously_found_meal_names so the same restaurants don't trigger a new notification after a failed refresh
+            self.ui.update_meals_display(f"{error_msg}\nWill retry on the next refresh.", refresh_time_str)
+            return
+
+        output_lines, current_meal_names_now = [], set()
+        for meal in meals:
+            output_lines.extend([f"Restaurant: {meal['restaurant_name']}", f"Meal: {meal['meal_name']}", f"Location: {meal['location']}", "Meals available", "-" * 40])
+            current_meal_names_now.add(meal['restaurant_name'])
+        newly_found = current_meal_names_now - self.previously_found_meal_names
+        if newly_found and self.notifications_enabled:
+            self._send_notification(f"New: {', '.join(sorted(newly_found))}"[:250])
+        if not meals:
+            if not self.target_texts:
+                output_lines.append("No restaurants selected. Click \"Edit Restaurants\" to add the ones you want to track.")
+            else:
+                output_lines.append(f"No meals found for specified restaurants in {self.city_names.get(city_id, f'city {city_id}')} at this time.")
+        self.previously_found_meal_names = current_meal_names_now
+        self.ui.update_meals_display("\n".join(output_lines), refresh_time_str)
+        print(f"GUI Refreshed: {refresh_time_str}. City: {city_id}. Found: {len(meals)}. New: {sorted(newly_found)}")
 
     def _send_notification(self, message_text: str):
         title = "odiFinder: New Restaurants!"
@@ -301,7 +360,6 @@ class OdiFinderApp:
                 print("Please install winotify: pip install winotify")
         except Exception as e:
             print(f"Failed to send notification: {e}")
-            import traceback
             traceback.print_exc()
 
     def handle_open_getodi(self):
@@ -356,7 +414,6 @@ class OdiFinderApp:
                     pystray.MenuItem("Exit", self.handle_exit_from_tray)
                 )
                 self.system_tray_icon = pystray.Icon("odiFinder", image, "odiFinder", menu)
-                import threading
                 threading.Thread(target=self.system_tray_icon.run, daemon=True).start()
                 print("System tray icon started.")
             except Exception as e:
@@ -365,13 +422,14 @@ class OdiFinderApp:
                 self.ui.deiconify_and_focus_main_window()
 
     def handle_show_window_from_tray(self):
+        # Called on the tray icon's thread; Tk calls must happen on the main thread
         if self.system_tray_icon and getattr(self.system_tray_icon, 'visible', False):
             try:
                 self.system_tray_icon.stop()
             except Exception as e:
                 print(f"Error stopping tray icon: {e}")
         self.system_tray_icon = None
-        self.ui.deiconify_and_focus_main_window()
+        self._run_on_ui_thread(self.ui.deiconify_and_focus_main_window)
         print("Application window shown from tray.")
 
     def handle_exit_from_tray(self):
@@ -382,7 +440,7 @@ class OdiFinderApp:
             except Exception as e:
                 print(f"Error stopping tray icon on exit: {e}")
             self.system_tray_icon = None
-        self.handle_quit_application()
+        self._run_on_ui_thread(self.handle_quit_application)
 
     def handle_open_debug_console(self):
         if self.ui:
@@ -454,7 +512,6 @@ if __name__ == "__main__":
         print("Program exited via SystemExit.")
     except Exception as e:
         print(f"A critical unhandled error occurred: {e}")
-        import traceback
         traceback.print_exc()
     finally:
         print("Top-level finally: Ensuring cleanup.")

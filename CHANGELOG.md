@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 10 October 2026
+
+### Fixed
+- The app now logs in again automatically when the getodi.com session expires (before, it silently showed "No meals found" until restarted)
+- A failed refresh no longer causes duplicate "New" notifications for the same restaurants once it works again
+- Pages are no longer requested with Brotli compression, which could make every check come back empty when the optional `brotli` package wasn't installed
+- The saved light/dark theme is no longer reset to dark on every login
+- The reset settings (🗑) button now works, with a confirmation prompt
+- The reset button's tooltip no longer throws an error on hover
+- The app no longer crashes on startup on systems without the `tr_TR.UTF-8` locale
+- System tray "Show" and "Exit" now run on the UI thread, avoiding possible crashes or freezes
+- "Askıdan al" buttons written in capitals (and "Askıdan Ücretsiz Al") are detected; buttons marked `disabled`/`aria-disabled` are treated as unavailable
+- A search term that matches several restaurants now reports all of them instead of only the first
+- The icon is found even when the app is started from a different folder
+
+### Changed
+- Refreshing runs in the background, so the window no longer freezes during checks; the button shows "Refreshing..." meanwhile
+- Re-login no longer opens pop-up dialogs; the result is shown in the main window
+- City names load in the background with a timeout instead of possibly blocking startup
+- New installs start with an empty restaurant list and a hint to add restaurants
+- Removed unused code and duplicate imports
+
 ## [1.4.4] - 20 December 2025
 - Updated to work with the new website interface structure, so meal available count is gone :(
 - "getodi.com" button now redirects to the corresponding city page

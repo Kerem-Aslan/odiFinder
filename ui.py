@@ -1,6 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, ttk, font as tkFont
-from tkinter import messagebox, ttk, font as tkFont
+from tkinter import messagebox, font as tkFont
 import os
 import sys
 import code # For debug console
@@ -63,6 +62,8 @@ class OdiFinderUI:
         self.save_interval_button = None
         self.refresh_button = None
         self.getodi_button = None
+        self.reset_settings_button = None
+        self.button_frame_main = None
         
         # Debug console state
         self._debug_console_state = {
@@ -149,7 +150,7 @@ class OdiFinderUI:
 
     def initialize_main_window(self, initial_settings):
         self.app_root = tk.Tk()
-        self.app_root.title(f"odiFinder {initial_settings.get('version', '1.3')}")
+        self.app_root.title(f"odiFinder {initial_settings.get('version', '')}".strip())
         self._set_icon_for_window(self.app_root)
         self.app_root.geometry(f"750x450+{(self.app_root.winfo_screenwidth() - 750) // 2}+{(self.app_root.winfo_screenheight() - 450) // 2}")
 
@@ -334,6 +335,15 @@ class OdiFinderUI:
         if type == "error": messagebox.showerror(title, message, parent=parent)
         elif type == "warning": messagebox.showwarning(title, message, parent=parent)
         else: messagebox.showinfo(title, message, parent=parent)
+
+    def ask_yes_no(self, title, message):
+        parent = self.app_root if self.app_root and self.app_root.winfo_exists() else None
+        return messagebox.askyesno(title, message, parent=parent)
+
+    def set_refreshing(self, is_refreshing):
+        if self.refresh_button and self.refresh_button.winfo_exists():
+            self.refresh_button.config(text="Refreshing..." if is_refreshing else "Refresh Now",
+                                       state=tk.DISABLED if is_refreshing else tk.NORMAL)
             
     def show_edit_restaurants_dialog(self, current_restaurants, save_callback):
         if not self.app_root: return
@@ -486,9 +496,10 @@ class OdiFinderUI:
     def _create_tooltip(self, widget, text):
         """Create a tooltip for a given widget"""
         def show_tooltip(event):
-            x, y, _, _ = widget.bbox("insert")
-            x += widget.winfo_rootx() + 25
-            y += widget.winfo_rooty() + 25
+            if self.tooltip is not None:
+                self.tooltip.destroy()
+            x = widget.winfo_rootx() + 25
+            y = widget.winfo_rooty() + widget.winfo_height() + 5
             
             # Create a toplevel window
             self.tooltip = tk.Toplevel(widget)
@@ -511,7 +522,7 @@ class OdiFinderUI:
 
     def update_settings_display(self, settings):
         """Update UI elements with new settings values"""
-        if self.username_entry:
+        if self.login_window and self.username_entry:
             self.username_entry.delete(0, tk.END)
             self.username_entry.insert(0, settings.get('username', ''))
         
