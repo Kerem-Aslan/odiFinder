@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import messagebox, font as tkFont
 import os
 import sys
+import threading
 import code # For debug console
 import platform
 
@@ -69,7 +70,7 @@ class OdiFinderUI:
         self._debug_console_state = {
             "window": None, "console_instance": None, "original_stdout": None,
             "original_stderr": None, "ps1": ">>> ", "ps2": "... ",
-            "cleanup_func_registered": False, "output_text_widget": None,
+            "streams_redirected": False, "output_text_widget": None,
             "input_entry_widget": None,
             "debug_run_button": None # Added to store debug run button
         }
@@ -94,6 +95,19 @@ class OdiFinderUI:
         # Add other specific arity lambdas if needed
         # Default for no-argument callbacks or where None is handled by caller
         return self.callbacks.get(callback_name, lambda: None)
+
+    @staticmethod
+    def _window_exists(window):
+        """winfo_exists() raises TclError once the Tk application is destroyed, so treat that as 'gone'."""
+        if window is None:
+            return False
+        try:
+            return bool(window.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def login_window_exists(self):
+        return self._window_exists(self.login_window)
 
     def _set_icon_for_window(self, window_instance):
         if not (self.icon_path and os.path.exists(self.icon_path)): return
@@ -136,16 +150,18 @@ class OdiFinderUI:
         self.password_entry.bind('<Return>', lambda e: _login_action())
         login_button = tk.Button(self.login_window, text="Login", command=_login_action, bg=LOGIN_BUTTON_COLOR_BG, fg=LOGIN_BUTTON_TEXT_COLOR_FG, activebackground=LOGIN_BUTTON_COLOR_ACTIVE_BG, activeforeground=LOGIN_BUTTON_TEXT_COLOR_FG)
         login_button.pack(pady=10)
+        # Clear our reference when the window is closed with X, so cleanup doesn't touch the destroyed Tk app
+        self.login_window.protocol("WM_DELETE_WINDOW", self.close_login_window)
         
         self.login_window.mainloop()
 
     def close_login_window(self):
-        if self.login_window:
+        if self.login_window_exists():
             self.login_window.destroy()
-            self.login_window = None
+        self.login_window = None
             
     def show_login_error(self, title="Login Failed", message="Incorrect username or password."):
-        if self.login_window:
+        if self.login_window_exists():
             messagebox.showerror(title, message, parent=self.login_window)
 
     def initialize_main_window(self, initial_settings):
@@ -242,6 +258,8 @@ class OdiFinderUI:
             self.app_root.mainloop()
 
     def destroy_main_window(self):
+        # Always put stdout/stderr back first: once the Tk app is destroyed, writing to the console widget raises TclError
+        self._restore_std_streams()
         if self.app_root:
             if self._debug_console_state["window"] and self._debug_console_state["window"].winfo_exists():
                 self._on_debug_console_close_internal()
@@ -327,8 +345,8 @@ class OdiFinderUI:
         return self.notifications_var.get() if self.notifications_var else True
         
     def show_message(self, type="info", title="Info", message=""):
-        parent = self.app_root if self.app_root and self.app_root.winfo_exists() else self.login_window
-        if not parent or not parent.winfo_exists(): # Fallback if no window is available
+        parent = self.app_root if self._window_exists(self.app_root) else self.login_window
+        if not self._window_exists(parent): # Fallback if no window is available
             print(f"[{type.upper()}] {title}: {message}") # Print to console as last resort
             return
 
@@ -376,20 +394,32 @@ class OdiFinderUI:
         tk.Button(button_frame_edit, text="Save", command=_save_action, bg=self.active_colors["BUTTON_BG"], fg=self.active_colors["BUTTON_TEXT_FG"], activebackground=self.active_colors["BUTTON_ACTIVE_BG"], activeforeground=self.active_colors["BUTTON_TEXT_FG"], relief=tk.FLAT, borderwidth=0, padx=10, pady=3).pack()
 
     class DebugConsoleRedirector:
+        """
+        Collects stdout/stderr for the debug console. write() can be called from any thread
+        (e.g. the refresh worker), so it only buffers; the Tk thread drains the buffer
+        periodically via _flush_to_widget().
+        """
         def __init__(self, text_widget):
             self.text_widget = text_widget
             self.buffer = ""
+            self.lock = threading.Lock()
         def write(self, s):
-            self.buffer += s
-            if self.text_widget.winfo_exists():
-                self.text_widget.after(0, self._update_text_widget)
-        def _update_text_widget(self):
-            if self.text_widget.winfo_exists():
-                self.text_widget.config(state=tk.NORMAL)
-                self.text_widget.insert(tk.END, self.buffer)
-                self.text_widget.see(tk.END)
-                self.text_widget.config(state=tk.DISABLED)
-                self.buffer = ""
+            with self.lock:
+                self.buffer += s
+            return len(s)
+        def _flush_to_widget(self):
+            with self.lock:
+                text, self.buffer = self.buffer, ""
+            if not text:
+                return
+            try:
+                if self.text_widget.winfo_exists():
+                    self.text_widget.config(state=tk.NORMAL)
+                    self.text_widget.insert(tk.END, text)
+                    self.text_widget.see(tk.END)
+                    self.text_widget.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
         def flush(self): pass
 
     def open_debug_console(self, console_context_provider):
@@ -412,11 +442,21 @@ class OdiFinderUI:
         self._debug_console_state["input_entry_widget"] = tk.Entry(input_frame, bg=self.active_colors["TEXT_AREA_BG"], fg=self.active_colors["TEXT_AREA_FG"], insertbackground=self.active_colors["ENTRY_INSERT_BG"], font=("Consolas", 10) if platform.system() == "Windows" else ("Monospace", 10))
         self._debug_console_state["input_entry_widget"].pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
 
-        if not self._debug_console_state["original_stdout"]: self._debug_console_state["original_stdout"] = sys.stdout
-        if not self._debug_console_state["original_stderr"]: self._debug_console_state["original_stderr"] = sys.stderr
-        
-        sys.stdout = OdiFinderUI.DebugConsoleRedirector(self._debug_console_state["output_text_widget"])
-        sys.stderr = sys.stdout
+        # In the windowed exe sys.stdout/sys.stderr are None, so track the redirect with a flag rather than their truthiness
+        if not self._debug_console_state["streams_redirected"]:
+            self._debug_console_state["original_stdout"] = sys.stdout
+            self._debug_console_state["original_stderr"] = sys.stderr
+            self._debug_console_state["streams_redirected"] = True
+        redirector = OdiFinderUI.DebugConsoleRedirector(self._debug_console_state["output_text_widget"])
+        sys.stdout = redirector
+        sys.stderr = redirector
+
+        def _drain_output():
+            window = self._debug_console_state["window"]
+            if window is None or not window.winfo_exists():
+                return
+            redirector._flush_to_widget()
+            window.after(100, _drain_output)
 
         console_context = console_context_provider()
         self._debug_console_state["console_instance"] = code.InteractiveConsole(locals=console_context)
@@ -434,6 +474,7 @@ class OdiFinderUI:
             if not self._debug_console_state["console_instance"]: return
 
             is_multiline = self._debug_console_state["console_instance"].push(line)
+            redirector._flush_to_widget()  # Show the command's output before the next prompt
             
             current_output_widget = self._debug_console_state["output_text_widget"]
             current_output_widget.config(state=tk.NORMAL)
@@ -448,16 +489,19 @@ class OdiFinderUI:
         self._debug_console_state["debug_run_button"].pack(side=tk.LEFT, padx=(5,0))
             
         self._debug_console_state["window"].protocol("WM_DELETE_WINDOW", self._on_debug_console_close_internal)
-        self._debug_console_state["cleanup_func_registered"] = True
         self._debug_console_state["input_entry_widget"].focus_set()
+        _drain_output()
+
+    def _restore_std_streams(self):
+        if self._debug_console_state["streams_redirected"]:
+            sys.stdout = self._debug_console_state["original_stdout"]
+            sys.stderr = self._debug_console_state["original_stderr"]
+            self._debug_console_state["original_stdout"] = None
+            self._debug_console_state["original_stderr"] = None
+            self._debug_console_state["streams_redirected"] = False
 
     def _on_debug_console_close_internal(self):
-        if self._debug_console_state["original_stdout"]:
-            sys.stdout = self._debug_console_state["original_stdout"]
-            self._debug_console_state["original_stdout"] = None
-        if self._debug_console_state["original_stderr"]:
-            sys.stderr = self._debug_console_state["original_stderr"]
-            self._debug_console_state["original_stderr"] = None
+        self._restore_std_streams()
         
         if self._debug_console_state["window"] and self._debug_console_state["window"].winfo_exists():
             self._debug_console_state["window"].destroy()
@@ -468,7 +512,6 @@ class OdiFinderUI:
         self._debug_console_state["input_entry_widget"] = None
         
         self._get_callback('on_debug_console_closed_message')()
-        self._debug_console_state["cleanup_func_registered"] = False
 
     def deiconify_and_focus_main_window(self):
         if self.app_root and self.app_root.winfo_exists():
@@ -522,7 +565,7 @@ class OdiFinderUI:
 
     def update_settings_display(self, settings):
         """Update UI elements with new settings values"""
-        if self.login_window and self.username_entry:
+        if self.login_window_exists() and self.username_entry:
             self.username_entry.delete(0, tk.END)
             self.username_entry.insert(0, settings.get('username', ''))
         

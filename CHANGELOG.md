@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [1.5.0] - 10 October 2026
 
 ### Fixed
+- Fixed an "Unhandled exception in script" error (`can't invoke "winfo" command: application has been destroyed`) when closing the app from the login screen, or after the debug console had been opened
+- The debug console no longer touches the window from the background refresh thread, which could cause crashes while it was open
 - The app now logs in again automatically when the getodi.com session expires (before, it silently showed "No meals found" until restarted)
 - A failed refresh no longer causes duplicate "New" notifications for the same restaurants once it works again
 - Pages are no longer requested with Brotli compression, which could make every check come back empty when the optional `brotli` package wasn't installed

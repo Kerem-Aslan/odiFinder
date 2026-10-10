@@ -467,7 +467,7 @@ class OdiFinderApp:
                 self.ui.destroy_main_window()
             except Exception as e:
                 print(f"Error destroying main UI window during cleanup: {e}")
-        elif self.ui and self.ui.login_window and self.ui.login_window.winfo_exists():
+        elif self.ui and self.ui.login_window_exists():
             print("Login UI window exists, attempting to destroy.")
             try:
                 self.ui.close_login_window()

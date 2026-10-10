@@ -3,11 +3,17 @@ name: Build and release
 # On every push to main, read APP_VERSION from odiFinder.pyw. If there is no release for
 # that version yet, build odiFinder.exe on Windows and publish it as release v<APP_VERSION>.
 # To release: bump APP_VERSION, add a CHANGELOG.md entry, and merge to main.
+# To rebuild an existing release from the latest main, run it manually with "replace" checked.
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      replace:
+        description: 'Replace the existing release for this version (deletes its release and tag, then publishes again)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -30,11 +36,15 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if gh release view "v$version" > /dev/null 2>&1; then
+          if ! gh release view "v$version" > /dev/null 2>&1; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.replace }}" = "true" ]; then
+            echo "Release v$version exists and will be replaced."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "replace=true" >> "$GITHUB_OUTPUT"
+          else
             echo "Release v$version already exists, nothing to do."
             echo "release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/setup-python@v5
@@ -61,6 +71,14 @@ jobs:
             awk -v header="## [$version]" 'index($0, header) == 1 { found = 1; next } /^## \[/ { found = 0 } found' CHANGELOG.md
           } > release_notes.md
           cat release_notes.md
+
+      # Only delete the old release once the new exe has been built successfully
+      - name: Delete the existing release and tag
+        if: steps.version.outputs.replace == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "v${{ steps.version.outputs.version }}" --cleanup-tag --yes
 
       - uses: softprops/action-gh-release@v2
         if: steps.version.outputs.release == 'true'
