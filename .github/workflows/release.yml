@@ -1,10 +1,13 @@
 name: Build and release
 
-# Push a tag like v1.5.0 to build odiFinder.exe on Windows and publish it as a GitHub release.
+# On every push to main, read APP_VERSION from odiFinder.pyw. If there is no release for
+# that version yet, build odiFinder.exe on Windows and publish it as release v<APP_VERSION>.
+# To release: bump APP_VERSION, add a CHANGELOG.md entry, and merge to main.
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,39 +18,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read APP_VERSION and skip if already released
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^ *APP_VERSION = "\(.*\)"/\1/p' odiFinder.pyw)
+          if [ -z "$version" ]; then
+            echo "::error::Could not read APP_VERSION from odiFinder.pyw"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "Release v$version already exists, nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.version.outputs.release == 'true'
         with:
           python-version: '3.13'
 
       - name: Install dependencies
+        if: steps.version.outputs.release == 'true'
         run: pip install pyinstaller requests beautifulsoup4 winotify pillow pystray
 
-      - name: Check that the tag matches APP_VERSION
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          if ! grep -q "APP_VERSION = \"$version\"" odiFinder.pyw; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match APP_VERSION in odiFinder.pyw"
-            exit 1
-          fi
-
       - name: Build odiFinder.exe
+        if: steps.version.outputs.release == 'true'
         run: pyinstaller --onefile --windowed --name odiFinder --icon odiFinderlogo.ico --add-data "odiFinderlogo.ico;." --hidden-import pystray._win32 odiFinder.pyw
 
       - name: Write release notes from CHANGELOG.md
+        if: steps.version.outputs.release == 'true'
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+          version="${{ steps.version.outputs.version }}"
           {
-            echo "A Windows standalone \".exe\" release for $GITHUB_REF_NAME."
+            echo "A Windows standalone \".exe\" release for v$version."
             echo
             awk -v header="## [$version]" 'index($0, header) == 1 { found = 1; next } /^## \[/ { found = 0 } found' CHANGELOG.md
           } > release_notes.md
           cat release_notes.md
 
       - uses: softprops/action-gh-release@v2
+        if: steps.version.outputs.release == 'true'
         with:
-          name: odiFinder ${{ env.VERSION }}
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: odiFinder ${{ steps.version.outputs.version }}
           body_path: release_notes.md
           files: dist/odiFinder.exe
